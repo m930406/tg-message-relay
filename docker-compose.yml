@@ -1,0 +1,81 @@
+name: msg-relay
+
+# 架構：
+#   FB / IG / LINE / Discord  <-->  mautrix bridges  <-->  Synapse (本機 Matrix)  <-->  relay  <-->  Telegram 群組
+# 全部只在本機網路內互通，不需要對外開任何 port（Telegram 用 long polling）。
+# 要啟用哪些平台由 .env 的 COMPOSE_PROFILES 決定（例如 fb,ig,line,discord）。
+
+services:
+  synapse:
+    image: matrixdotorg/synapse:latest
+    restart: unless-stopped
+    volumes:
+      - ./data/synapse:/data
+    ports:
+      # 只綁 127.0.0.1，方便在本機用 Element 之類的 Matrix client 除錯
+      - "127.0.0.1:8008:8008"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8008/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Facebook Messenger
+  fb:
+    profiles: ["fb"]
+    image: dock.mau.dev/mautrix/meta:latest
+    restart: unless-stopped
+    volumes:
+      - ./data/fb:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+
+  # Instagram DM
+  ig:
+    profiles: ["ig"]
+    image: dock.mau.dev/mautrix/meta:ig-latest
+    restart: unless-stopped
+    volumes:
+      - ./data/ig:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+
+  # LINE（Beeper 的 bridgev2 LINE bridge，沒有現成 image，直接從 GitHub 原始碼 build）
+  line:
+    profiles: ["line"]
+    build:
+      context: https://github.com/beeper/line.git#main
+    image: local/matrix-line:latest
+    restart: unless-stopped
+    volumes:
+      - ./data/line:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+
+  # Discord（只轉發你在管理主題挑的伺服器頻道）
+  discord:
+    profiles: ["discord"]
+    image: dock.mau.dev/mautrix/discord:latest
+    restart: unless-stopped
+    volumes:
+      - ./data/discord:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
+
+  # Matrix <-> Telegram 轉發程式
+  relay:
+    build: ./relay
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HS_URL: http://synapse:8008
+      DB_PATH: /data/relay.db
+    volumes:
+      - ./data/relay:/data
+    depends_on:
+      synapse:
+        condition: service_healthy
