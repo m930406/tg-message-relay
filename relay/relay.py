@@ -347,6 +347,10 @@ class Store:
         self.db.commit()
         return [json.loads(r[0]) for r in rows]
 
+    def portal_rooms(self, platform):
+        return [row[0] for row in self.db.execute(
+            "SELECT room_id FROM rooms WHERE platform=? AND is_bot=0 AND ignored=0", (platform,))]
+
     def room_by_topic(self, topic_id):
         row = self.db.execute("SELECT room_id FROM rooms WHERE topic_id=?", (topic_id,)).fetchone()
         return self.room(row[0]) if row else None
@@ -460,6 +464,9 @@ class Matrix:
     async def join(self, room_id):
         await self.req("POST", f"/_matrix/client/v3/join/{self.q(room_id)}", json_body={})
 
+    async def invite(self, room_id, user_id):
+        await self.req("POST", f"/_matrix/client/v3/rooms/{self.q(room_id)}/invite", json_body={"user_id": user_id})
+
     async def receipt(self, room_id, event_id):
         await self.req("POST", f"/_matrix/client/v3/rooms/{self.q(room_id)}/receipt/m.read/{self.q(event_id)}",
                        json_body={})
@@ -559,6 +566,7 @@ class Relay:
         self.topic_locks = {}       # room_id -> asyncio.Lock，避免同一個聊天室重複建主題
         self.self_ghosts = set()    # 代表「你自己」的 bridge 帳號（你在手機 App 發的訊息會用它送進來）
         self.self_checked = 0.0
+        self.ghost_skip = set()     # 不用再檢查的（聊天室, 你的 Discord 分身）：bridge bot 在裡面，或沒有權限邀請
         self.locked = self.store.get("locked") == "1"  # 群組裡有外人：暫停轉發
         self.requests = {}          # room_id -> 是不是訊息請求（bridge 放在 m.bridge 狀態裡）
 
@@ -667,6 +675,8 @@ class Relay:
             r["title"] = self.topic_title(r["platform"], name) if name else ""
             r["approved"] = 0 if r["platform"] in APPROVE_PLATFORMS else 1
         self.store.save_room(r)
+        if r["platform"] == "discord" and not r["is_bot"] and not r["ignored"]:
+            asyncio.create_task(self.ensure_self_ghost(room_id, new_room=True))  # 新開的 Discord 私訊：馬上補邀請
         return None if r["ignored"] else r
 
     @staticmethod
@@ -1284,6 +1294,52 @@ class Relay:
             log.info("你自己的帳號：%s", ", ".join(sorted(found)) or "（尚未登入）")
         self.self_ghosts = found
 
+    @staticmethod
+    def is_discord_dm(invite):
+        """Discord 的一對一私訊是對方的分身建立、邀請你的；其他 Discord 聊天室都是 bridge bot。"""
+        return any(e.get("type") in ("m.room.create", "m.room.member")
+                   and platform_of(e.get("sender", "")) == ("discord", False)
+                   for e in invite.get("invite_state", {}).get("events", []))
+
+    def discord_self(self):
+        """代表你自己的 Discord 分身（還沒登入是 None）。"""
+        return next((g for g in self.self_ghosts if platform_of(g) == ("discord", False)), None)
+
+    async def ensure_self_ghost(self, room_id, new_room=False):
+        """Discord（舊版 bridge）的私訊聊天室裡沒有 bridge bot。你在 Discord App 傳訊息時，bridge 要讓代表你的分身
+        加入聊天室，卻派不在裡面的 bot 去邀請，被拒絕後那則訊息就沒送進來（補送歷史訊息時也一樣）。
+        先用你的帳號把分身邀請進來，它就能自己加入（bridge 收到這種邀請不會做任何事）。"""
+        # 剛登入時 bridge 會馬上建好最近的私訊，這時還沒查到你的帳號（最多 30 秒查一次），新聊天室就馬上重查
+        await self.refresh_self_ghosts(force=new_room and not self.discord_self())
+        ghost = self.discord_self()
+        if not ghost or (room_id, ghost) in self.ghost_skip:
+            return
+        bot = f"@discordbot:{SERVER_NAME}"
+        try:
+            if ((await self.mx.state(room_id, "m.room.member", bot)) or {}).get("membership") == "join":
+                self.ghost_skip.add((room_id, ghost))  # 伺服器頻道：bridge bot 在裡面，它自己邀請得了
+                return
+            mine = ((await self.mx.state(room_id, "m.room.member", ghost)) or {}).get("membership")
+            if mine not in ("join", "invite"):
+                await self.mx.invite(room_id, ghost)
+                log.info("已邀請你的 Discord 分身進入 %s，你從 Discord App 傳的訊息才轉得過來", room_id)
+        except MatrixError as e:
+            log.warning("沒辦法邀請你的 Discord 分身進入 %s：%s", room_id, e)
+            if e.status == 403:  # 沒有權限（例如你已經不在這個聊天室）：重試也沒用；其他錯誤下一輪再試
+                self.ghost_skip.add((room_id, ghost))
+
+    async def discord_self_loop(self):
+        """每 10 分鐘檢查一次每個 Discord 聊天室：剛登入、換帳號、分身被移出時都會補上邀請。"""
+        if "discord" not in BRIDGES:
+            return
+        while True:
+            for room_id in self.store.portal_rooms("discord"):
+                try:
+                    await self.ensure_self_ghost(room_id)
+                except Exception:  # noqa: BLE001
+                    log.exception("檢查 Discord 聊天室失敗：%s", room_id)
+            await asyncio.sleep(600)
+
     async def display_name(self, room_id, mxid):
         key = (room_id, mxid)
         if key not in self.names:
@@ -1476,12 +1532,15 @@ class Relay:
                 await asyncio.sleep(5)
                 continue
             rooms = resp.get("rooms", {})
-            for room_id in rooms.get("invite", {}):
+            for room_id, invite in rooms.get("invite", {}).items():
                 try:
                     await self.mx.join(room_id)
                     log.info("已加入聊天室 %s", room_id)
                 except MatrixError as e:
                     log.warning("加入 %s 失敗：%s", room_id, e)
+                    continue
+                if self.is_discord_dm(invite):  # 趁 bridge 補送歷史訊息之前，先把你的分身邀請進來
+                    asyncio.create_task(self.ensure_self_ghost(room_id, new_room=True))
             if not first:  # 第一次同步只記位置，不轉發舊訊息
                 for room_id, room in rooms.get("join", {}).items():
                     for ev in room.get("timeline", {}).get("events", []):
@@ -1719,7 +1778,7 @@ class Relay:
         await self.check_telegram()
         await self.check_members()
         await asyncio.gather(self.sync_loop(), self.tg_loop(), self.bot_rooms_loop(), self.login_check_loop(),
-                             self.deferred_loop(), self.member_guard_loop())
+                             self.deferred_loop(), self.member_guard_loop(), self.discord_self_loop())
 
 
 async def main():
