@@ -301,11 +301,18 @@ class Store:
     def deferred_count(self):
         return self.db.execute("SELECT COUNT(*) FROM deferred").fetchone()[0]
 
-    def next_deferred(self, bot_only=False):
-        row = self.db.execute(
-            "SELECT seq, room_id, event FROM deferred ORDER BY seq LIMIT 1" if not bot_only else
-            "SELECT d.seq, d.room_id, d.event FROM deferred d JOIN rooms r ON r.room_id = d.room_id"
-            " WHERE r.is_bot = 1 ORDER BY d.seq LIMIT 1").fetchone()
+    def room_deferred_count(self, room_id):
+        return self.db.execute("SELECT COUNT(*) FROM deferred WHERE room_id=?", (room_id,)).fetchone()[0]
+
+    def next_deferred(self, bot_only=False, room_id=None):
+        if room_id:
+            row = self.db.execute("SELECT seq, room_id, event FROM deferred WHERE room_id=? ORDER BY seq LIMIT 1",
+                                  (room_id,)).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT seq, room_id, event FROM deferred ORDER BY seq LIMIT 1" if not bot_only else
+                "SELECT d.seq, d.room_id, d.event FROM deferred d JOIN rooms r ON r.room_id = d.room_id"
+                " WHERE r.is_bot = 1 ORDER BY d.seq LIMIT 1").fetchone()
         return (row[0], row[1], json.loads(row[2])) if row else None
 
     def del_deferred(self, seq):
@@ -364,6 +371,10 @@ class Store:
 
     def save_msg(self, tg_msg_id, room_id, event_id):
         self.db.execute("INSERT OR REPLACE INTO msgs VALUES (?, ?, ?)", (tg_msg_id, room_id, event_id))
+        self.db.commit()
+
+    def forget_msg(self, tg_msg_id):
+        self.db.execute("DELETE FROM msgs WHERE tg_msg_id=?", (tg_msg_id,))
         self.db.commit()
 
     def event_for_tg(self, tg_msg_id):
@@ -557,6 +568,8 @@ class Relay:
     def __init__(self, session):
         self.flush_lock = asyncio.Lock()
         self.replaying = False      # 正在補送靜音時段累積的訊息
+        self.move_lock = asyncio.Lock()   # 你的訊息一則一則照順序搬到補送的訊息後面
+        self.moving = {}                  # 聊天室 → 還沒搬完的訊息數
         self.store = Store(DB_PATH)
         self.mx = Matrix(session, self.store)
         self.tg = Telegram(session)
@@ -1062,26 +1075,27 @@ class Relay:
         """新訊息要不要先存起來：群組有外人，或靜音時段而且還沒到提早補送的時間。"""
         return self.locked or (self.quiet() and not self.preloading())
 
-    async def flush_deferred(self, bot_only=False):
-        """把靜音時段累積的訊息照順序補送（每則都靜音），最後發一則摘要。bot_only：只補送管理主題的。"""
+    async def flush_deferred(self, bot_only=False, room_id=None):
+        """把靜音時段累積的訊息照順序補送（每則都靜音），最後發一則摘要。
+        bot_only：只補送管理主題的。room_id：只補送這個聊天的（你在它的主題回覆時），不發摘要。"""
         async with self.flush_lock:
             count, rooms = 0, set()
             self.replaying = True
             try:
-                while item := self.store.next_deferred(bot_only):
-                    seq, room_id, ev = item
+                while item := self.store.next_deferred(bot_only, room_id):
+                    seq, rid, ev = item
                     try:
-                        await self.on_matrix_event(room_id, ev, replay=True)
+                        await self.on_matrix_event(rid, ev, replay=True)
                     except Exception:  # noqa: BLE001
-                        log.exception("補送訊息失敗 %s %s", room_id, ev.get("event_id"))
+                        log.exception("補送訊息失敗 %s %s", rid, ev.get("event_id"))
                     self.store.del_deferred(seq)
                     is_edit = ((ev.get("content") or {}).get("m.relates_to") or {}).get("rel_type") == "m.replace"
                     if ev.get("type") in ("m.room.message", "m.sticker") and not is_edit:
                         count += 1
-                        rooms.add(room_id)
+                        rooms.add(rid)
             finally:
                 self.replaying = False
-            if count and not bot_only:
+            if count and not bot_only and not room_id:
                 await self.tg.call("sendMessage", {
                     "chat_id": TG_CHAT_ID, "disable_notification": self.quiet(),
                     "text": f"📬 靜音期間有 {count} 則新訊息（{len(rooms)} 個聊天），已補送到各自的主題"
@@ -1637,6 +1651,10 @@ class Relay:
             _, target = self.store.event_for_tg(reply["message_id"])
             if target:
                 content["m.relates_to"] = {"m.in_reply_to": {"event_id": target}}
+        # 這個聊天還有靜音期間排隊、你還沒看到的訊息：送出後先補送它們，再把你的訊息搬到後面。
+        # 前一則還在搬的時候，接著打的也要搬，順序才不會亂。群組有外人時照舊先存著。
+        behind = (not r["is_bot"] and not self.locked
+                  and (self.moving.get(r["room_id"]) or self.store.room_deferred_count(r["room_id"])))
         try:
             event_id = await self.mx.send(r["room_id"], content)
         except MatrixError as e:
@@ -1659,12 +1677,71 @@ class Relay:
                 await self.tg_send(r, "sendMessage", {"text": "🔒 已送出，並從 Telegram 刪除剛剛那則含密碼 / cookie 的訊息"})
             except TgError as e:
                 await self.reply(msg, f"⚠️ 無法自動刪除這則訊息，請手動刪除：{e}")
-        last = self.last_event.get(r["room_id"])
+        if behind:
+            # 在背景做：補送要一則一則送，不要卡住你接著打的訊息
+            self.moving[r["room_id"]] = self.moving.get(r["room_id"], 0) + 1
+            asyncio.create_task(self.catch_up(msg, r, event_id))
+            return
+        await self.mark_read(r["room_id"])
+
+    async def mark_read(self, room_id):
+        last = self.last_event.get(room_id)
         if last:
             try:
-                await self.mx.receipt(r["room_id"], last)
+                await self.mx.receipt(room_id, last)
             except MatrixError as e:
                 log.debug("送已讀失敗：%s", e)
+
+    async def catch_up(self, msg, r, event_id):
+        """你回覆時這個聊天還有排隊的訊息：補送這個聊天的（其他聊天照舊等），再把你的訊息搬到最後面。"""
+        try:
+            async with self.move_lock:
+                await self.flush_deferred(room_id=r["room_id"])
+                await self.move_below(msg, r, event_id)
+                await self.mark_read(r["room_id"])
+        except Exception:  # noqa: BLE001
+            log.exception("補送並搬移你的訊息失敗")
+        finally:
+            self.moving[r["room_id"]] -= 1
+
+    MOVE_LABEL = "我"
+
+    async def move_below(self, msg, r, event_id):
+        """把你剛傳的訊息搬到補送的訊息後面：bot 照貼一則（開頭標「我」），成功了才刪掉原本那則。
+        Bot 不能用你的身分發訊息，不標的話私聊裡會看起來像對方傳的。貼圖、圓形影片不能加字，留在原位。"""
+        label = self.MOVE_LABEL
+        shift = tg_len(label + "\n")
+        bold = [{"type": "bold", "offset": 0, "length": tg_len(label)}]
+        params = {"disable_notification": True}
+        reply = msg.get("reply_to_message")
+        if reply and reply.get("message_id") != msg.get("message_thread_id"):
+            params["reply_parameters"] = {"message_id": reply["message_id"], "allow_sending_without_reply": True}
+        if msg.get("text"):
+            method = "sendMessage"
+            params.update(text=f"{label}\n{msg['text']}",
+                          entities=bold + [dict(e, offset=e["offset"] + shift) for e in msg.get("entities", [])])
+            if msg.get("link_preview_options"):
+                params["link_preview_options"] = msg["link_preview_options"]
+        elif any(msg.get(k) for k in ("photo", "video", "animation", "document", "audio", "voice")):
+            method = "copyMessage"
+            caption = msg.get("caption")
+            params.update(from_chat_id=TG_CHAT_ID, message_id=msg["message_id"],
+                          caption=f"{label}\n{caption}" if caption else label,
+                          caption_entities=bold + [dict(e, offset=e["offset"] + shift)
+                                                   for e in msg.get("caption_entities", [])])
+        else:
+            return
+        try:
+            moved = await self.tg_send(r, method, params)
+        except TgError as e:
+            log.warning("沒辦法把你的訊息搬到後面，留在原位：%s", e)
+            return
+        self.store.save_msg(moved["message_id"], r["room_id"], event_id)
+        self.store.forget_msg(msg["message_id"])
+        try:
+            await self.tg.call("deleteMessage", {"chat_id": TG_CHAT_ID, "message_id": msg["message_id"]})
+        except TgError as e:
+            log.warning("刪除原本那則失敗：%s", e)
 
     async def caption_supported(self, room_id, content):
         """bridge 有沒有說這種檔案可以附說明文字（bridge 放在聊天室裡的 com.beeper.room_features）。
